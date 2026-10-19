@@ -732,7 +732,8 @@ export class CubejsServerCore {
             driverPromise[`${dataSource}@pre_agg`] = null;
           }
 
-          if (driver) {
+          // A factory's shared instance may be serving queries under another key
+          if (driver && !this.oauthTokenHolders.has(driver)) {
             await driver.release();
           }
 
@@ -766,7 +767,7 @@ export class CubejsServerCore {
     const orchestratorApi = this.createOrchestratorApi(
       getDriver,
       {
-        holdsOAuthToken: (driver) => this.oauthTokenHolders.has(driver),
+        driverForHealthCheck: (dataSource) => this.healthCheckDriver(driverPromise, getDriver, dataSource),
         externalDriverFactory: this.options.externalDriverFactory && (async () => {
           if (externalPreAggregationsDriverPromise) {
             return externalPreAggregationsDriverPromise;
@@ -822,8 +823,9 @@ export class CubejsServerCore {
   }
 
   /**
-   * Hands a passthrough driver the token for `context` before each use. Pre-aggregation
-   * lookups get none: their builds run with the driver's own credentials.
+   * Hands a passthrough driver the token for `context` before each use. A context without
+   * one changes nothing, so a driver never falls back from a token to its own credentials.
+   * Pre-aggregation lookups get none: their builds run with the driver's own credentials.
    */
   protected async withOAuthToken(
     driver: BaseDriver,
@@ -845,16 +847,41 @@ export class CubejsServerCore {
       return driver;
     }
 
-    const token = (await this.options.contextToOAuthToken?.({ ...context, dataSource })) || undefined;
-    driver.setOAuthToken(token);
-
+    const token = await this.options.contextToOAuthToken?.({ ...context, dataSource });
     if (token) {
+      driver.setOAuthToken(token);
       this.oauthTokenHolders.add(driver);
-    } else {
-      this.oauthTokenHolders.delete(driver);
     }
 
     return driver;
+  }
+
+  /**
+   * A driver a health check may test, or null to skip it. A driver holding a token is
+   * skipped without calling contextToOAuthToken: testing it would test that user, not the pod.
+   */
+  protected async healthCheckDriver(
+    driverPromise: Record<string, Promise<BaseDriver> | null>,
+    getDriver: DriverFactoryByDataSource,
+    dataSource: string,
+  ): Promise<BaseDriver | null> {
+    const cached = driverPromise[dataSource];
+    if (cached) {
+      const driver = await cached;
+      return this.oauthTokenHolders.has(driver) ? null : driver;
+    }
+
+    return getDriver(dataSource);
+  }
+
+  /** `CUBEJS_DB_OAUTH_TOKEN_PASSTHROUGH` for a data source, false for one not declared. */
+  protected oauthTokenPassthroughEnv(dataSource: string): boolean {
+    const declared: string[] = getEnv('dataSources');
+    if (declared.length > 0 && !declared.includes(dataSource)) {
+      return false;
+    }
+
+    return getEnv('dbOAuthTokenPassthrough', { dataSource });
   }
 
   protected enableOAuthTokenPassthrough(driver: BaseDriver, dataSource: string): void {
@@ -1047,8 +1074,8 @@ export class CubejsServerCore {
     context: DriverContext,
     options?: OrchestratorInitedOptions,
   ): Promise<BaseDriver> {
-    const dataSource = assertDataSource(context.dataSource);
     const val = await this.options.driverFactory(context);
+    const dataSource = context.dataSource || 'default';
     let driver: BaseDriver;
     let oauthTokenPassthrough: boolean | undefined;
 
@@ -1063,13 +1090,13 @@ export class CubejsServerCore {
             await CubejsServerCore.getDriverMaxPool(context, options),
           testConnectionTimeout: options?.testConnectionTimeout,
         };
-      opts.dataSource = dataSource;
+      opts.dataSource = assertDataSource(context.dataSource);
       opts.preAggregations = context.preAggregations || false;
       driver = CubejsServerCore.createDriver(type, opts);
       oauthTokenPassthrough = passthrough;
     }
 
-    if (oauthTokenPassthrough ?? getEnv('dbOAuthTokenPassthrough', { dataSource })) {
+    if (oauthTokenPassthrough ?? this.oauthTokenPassthroughEnv(dataSource)) {
       this.enableOAuthTokenPassthrough(driver, dataSource);
     }
 
