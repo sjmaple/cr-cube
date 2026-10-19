@@ -2,6 +2,7 @@
 import * as stream from 'stream';
 import pt from 'promise-timeout';
 import {
+  BaseDriver,
   ContinueWaitError,
   DriverFactoryByDataSource,
   DriverType,
@@ -17,6 +18,8 @@ export interface OrchestratorApiOptions extends QueryOrchestratorOptions {
   contextToDbType: (dataSource: string) => Promise<DatabaseType>;
   contextToExternalDbType: () => DatabaseType;
   redisPrefix?: string;
+  /** A driver holding a user's OAuth token: a health check would test that user, not the pod. */
+  holdsOAuthToken?: (driver: BaseDriver) => boolean;
 }
 
 export class OrchestratorApi {
@@ -205,6 +208,10 @@ export class OrchestratorApi {
     if (driverFn) {
       try {
         const driver = await driverFn(dataSource);
+        if (this.options.holdsOAuthToken?.(driver)) {
+          return;
+        }
+
         await driver.testConnection();
         this.logger('Connection test completed successfully', {
           driverType,
