@@ -139,6 +139,11 @@ export type BaseQueryOptions = {
   joinHints?: (string | string[])[];
   /** Planned for the same options without the dialect, see `plan()` */
   plan?: QueryPlan;
+  /**
+   * The data source the dialect was picked for, set where a model renders each data source in
+   * one dialect: the native planner caches the query's compiled templates under it
+   */
+  dataSource?: string;
   subqueryJoins?: CustomSubQueryJoin[];
   cubeAliasPrefix?: string;
   paramAllocator?: ParamAllocator | null;
@@ -788,11 +793,18 @@ export class BaseQuery {
       join: this.join,
       joinGraphPaths: this.joinGraphPaths,
       cubeNames: this.allCubeNames,
-      dataSource: this.dataSource ?? null,
+      dataSource: this.detectDataSource() ?? null,
     };
   }
 
-  public get dataSource() {
+  /**
+   * The data source the dialect was picked for, or else the one the query's cubes share
+   */
+  public get dataSource(): string | undefined {
+    return this.options.dataSource ?? this.detectDataSource();
+  }
+
+  protected detectDataSource(): string | undefined {
     const dataSources = R.uniq(this.allCubeNames.map(c => this.cubeDataSource(c)));
     if (dataSources.length > 1 && !this.externalPreAggregationQuery()) {
       throw new UserError(`To join across data sources use rollupJoin with Cube Store. If rollupJoin is defined, this error indicates it doesn't match the query. Please use Rollup Designer to verify it's definition. Found data sources: ${dataSources.join(', ')}`);
@@ -1174,7 +1186,7 @@ export class BaseQuery {
       maskedMembers: this.options.maskedMembers,
       memberToAlias: this.options.memberToAlias,
       subqueryJoins: this.options.subqueryJoins,
-      dataSource: this.nativeDataSource(),
+      dataSource: this.options.dataSource ?? null,
     };
 
     try {
@@ -1244,33 +1256,13 @@ export class BaseQuery {
       // must see the same masked members as the SQL build.
       maskedMembers: this.options.maskedMembers,
       subqueryJoins: this.options.subqueryJoins,
-      dataSource: this.nativeDataSource(),
+      dataSource: this.options.dataSource ?? null,
     };
 
     const buildResult = nativeBuildSqlAndParams(queryParams, this.compilers.compiler.modelContext);
 
     const [, , preAggResult] = buildResult;
     return this.applyNativePreAggResult(preAggResult);
-  }
-
-  /**
-   * The key the native planner caches this query's templates under, or null to compile them per query.
-   * Don't read the `dataSource` getter here in general: it can match pre-aggregations natively and
-   * recurses on some queries.
-   */
-  protected nativeDataSource(): string | null {
-    // Only CompilerApi builds a query in the dialect of its data source
-    if (!this.options.queryFactory) {
-      return null;
-    }
-    if (this.options.plan) {
-      return this.options.plan.dataSource;
-    }
-    // Safe to read the getter: a pre-aggregation query doesn't match pre-aggregations
-    if (this.options.preAggregationQuery) {
-      return this.dataSource ?? null;
-    }
-    return null;
   }
 
   public applyNativePreAggResult(preAggResult: PreAggregationUsageInfo[] | null | undefined): PreAggregationForQuery | undefined {
@@ -1372,7 +1364,9 @@ export class BaseQuery {
     const ExternalQuery = this.externalQueryClass;
     return new ExternalQuery(this.compilers, {
       ...this.options,
-      externalQueryClass: null
+      externalQueryClass: null,
+      // Renders the same data source in another dialect
+      dataSource: undefined,
     });
   }
 
